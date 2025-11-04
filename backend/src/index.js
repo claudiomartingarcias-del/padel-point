@@ -4,21 +4,30 @@ import cors from 'cors';
 import admin from 'firebase-admin';
 
 const app = express();
-app.use(cors());
+app.use(cors());                
 app.use(express.json());
 
-// Inicializa Firebase Admin (usa la Service Account que pondrás luego)
+// Log simple (útil para debug)
+app.use((req, _res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
+  next();
+});
+
+
 admin.initializeApp();
 
-// Endpoint de prueba
+const db = admin.firestore();
+
+/* -------------------- HEALTH -------------------- */
 app.get('/health', (_req, res) => {
   res.json({ ok: true, ts: Date.now() });
 });
 
-// Crear usuario en Firebase Auth
+/* -------------------- USERS (abierto) -------------------- */
 app.post('/users', async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const { email, password } = req.body || {};
+    if (!email || !password) return res.status(400).json({ error: 'email y password requeridos' });
     const user = await admin.auth().createUser({ email, password });
     res.json({ uid: user.uid, email: user.email });
   } catch (error) {
@@ -26,11 +35,12 @@ app.post('/users', async (req, res) => {
   }
 });
 
-// Guardar una nota en Firestore
+/* -------------------- NOTES (abierto) -------------------- */
+// (en Etapa 2 las protegemos con token)
 app.post('/notes', async (req, res) => {
   try {
-    const { uid, text } = req.body;
-    const db = admin.firestore();
+    const { uid, text } = req.body || {};
+    if (!uid || !text) return res.status(400).json({ error: 'uid y text requeridos' });
     const doc = await db.collection('notes').add({
       uid,
       text,
@@ -42,6 +52,94 @@ app.post('/notes', async (req, res) => {
   }
 });
 
-// Arrancar el servidor
+
+// Verifica Bearer <ID_TOKEN> de Firebase
+async function authMiddleware(req, res, next) {
+  try {
+    const header = req.headers.authorization || '';
+    const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+    if (!token) return res.status(401).json({ message: 'No token' });
+    const decoded = await admin.auth().verifyIdToken(token);
+    req.user = { uid: decoded.uid, email: decoded.email || null };
+    next();
+  } catch (err) {
+    return res.status(401).json({ message: 'Token inválido', detail: err.message });
+  }
+}
+
+/* -------------------- MATCHES -------------------- */
+// Crear partido 
+app.post('/matches', authMiddleware, async (req, res) => {
+  try {
+    const payload = req.body || {};
+    payload.createdBy = req.user.uid;
+    payload.createdAt = admin.firestore.FieldValue.serverTimestamp();
+    payload.players = Array.isArray(payload.players) && payload.players.length
+      ? payload.players
+      : [req.user.uid];
+    payload.status = payload.status || 'open'; 
+   
+    const ref = await db.collection('matches').add(payload);
+    const doc = await ref.get();
+    res.status(201).json({ id: ref.id, ...doc.data() });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Listar partidos 
+app.get('/matches', async (req, res) => {
+  try {
+    let q = db.collection('matches');
+    const level = req.query.level ? Number(req.query.level) : null;
+    const date = req.query.date || null;
+
+    if (date) q = q.where('date', '==', date);
+
+    
+    
+    if (level !== null && !Number.isNaN(level)) {
+      q = q.where('levelMin', '<=', level);
+    }
+
+    const snap = await q.orderBy('createdAt', 'desc').limit(50).get();
+    let items = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+
+    if (level !== null && !Number.isNaN(level)) {
+      items = items.filter(m => (typeof m.levelMax === 'number' ? m.levelMax >= level : true));
+    }
+
+    res.json(items);
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Unirse a partido 
+app.post('/matches/:id/join', authMiddleware, async (req, res) => {
+  try {
+    const uid = req.user.uid;
+    const matchRef = db.collection('matches').doc(req.params.id);
+    const matchDoc = await matchRef.get();
+    if (!matchDoc.exists) return res.status(404).json({ message: 'Partido no encontrado' });
+
+    const match = matchDoc.data() || {};
+    const players = Array.isArray(match.players) ? match.players : [];
+    const maxPlayers = typeof match.maxPlayers === 'number' ? match.maxPlayers : 4;
+
+    if (players.includes(uid)) return res.status(400).json({ message: 'Ya estás en el partido' });
+    if (players.length >= maxPlayers) return res.status(400).json({ message: 'Partido lleno' });
+
+    await matchRef.update({ players: admin.firestore.FieldValue.arrayUnion(uid) });
+    res.json({ message: 'Te uniste al partido' });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+/* -------------------- 404 -------------------- */
+app.use((_req, res) => res.status(404).json({ error: 'Not found' }));
+
+/* -------------------- START -------------------- */
 const port = process.env.PORT || 3001;
 app.listen(port, () => console.log(`✅ API corriendo en http://localhost:${port}`));
