@@ -1,6 +1,4 @@
-/* =========================
- * Firebase Functions (Gen2) - PadelPoint API
- * ========================= */
+/* ====== Firebase Functions Gen2 + Express (Padel) ====== */
 const express = require('express');
 const cors = require('cors');
 const admin = require('firebase-admin');
@@ -8,290 +6,322 @@ const { onRequest } = require('firebase-functions/v2/https');
 const { setGlobalOptions } = require('firebase-functions/v2/options');
 
 setGlobalOptions({ region: 'us-central1', memory: '256MiB' });
-
-// En Functions usamos credenciales gestionadas
 admin.initializeApp();
-const db = admin.firestore();
 
 const app = express();
-
-// CORS (agregá dominios de tu front si los tenés)
-app.use(cors({
-  origin: [
-    'http://localhost:3000',
-    'http://127.0.0.1:3000',
-    // agregá aquí tu dominio web si lo tenés
-  ],
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS']
-}));
+app.use(cors({ origin: true }));
 app.use(express.json());
 
-// Log simple
-app.use((req, _res, next) => {
-  console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
-  next();
-});
+const db = admin.firestore();
 
-/* -------- HEALTH -------- */
-app.get('/health', (_req, res) => {
-  res.json({ ok: true, env: 'functions', ts: Date.now() });
-});
+/* --------- Utils --------- */
+const BAND_RANK = { '8va': 1, '7ma': 2, '6ta': 3, '5ta': 4, '4ta': 5, '3ra': 6 };
+const rankOf = (b) => BAND_RANK[b] ?? null;
+const nowTs = () => admin.firestore.FieldValue.serverTimestamp();
 
-/* -------- USERS (abierto) --------
- * Crea usuario en Firebase Auth por email/password (mínimo 6 caracteres).
- */
+/* --------- Health --------- */
+app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
+
+/* --------- Auth middleware (ID Token de Firebase) --------- */
+async function authMiddleware(req, res, next) {
+  try {
+    const h = req.headers.authorization || '';
+    if (!h.startsWith('Bearer ')) return res.status(401).json({ message: 'No token' });
+    const decoded = await admin.auth().verifyIdToken(h.slice(7));
+    req.user = { uid: decoded.uid, email: decoded.email || null };
+    next();
+  } catch (e) {
+    return res.status(401).json({ message: 'Token inválido', detail: e.message });
+  }
+}
+
+/* ======================= USERS / PERFIL ======================= */
+/** Alta simple de usuario por API (pruebas) */
 app.post('/users', async (req, res) => {
   try {
     const { email, password } = req.body || {};
     if (!email || !password) return res.status(400).json({ error: 'email y password requeridos' });
-    const user = await admin.auth().createUser({ email, password });
-    res.json({ uid: user.uid, email: user.email });
-  } catch (error) {
-    res.status(400).json({ error: error.message });
-  }
-});
-
-/* -------- Auth middleware (rutas protegidas) -------- */
-async function authMiddleware(req, res, next) {
-  try {
-    const header = req.headers.authorization || '';
-    const token = header.startsWith('Bearer ') ? header.slice(7) : '';
-    if (!token) return res.status(401).json({ message: 'No token' });
-    const decoded = await admin.auth().verifyIdToken(token);
-    req.user = { uid: decoded.uid, email: decoded.email || null };
-    next();
-  } catch (err) {
-    return res.status(401).json({ message: 'Token inválido', detail: err.message });
-  }
-}
-
-/* =======================================
- * PROFILES
- * ======================================= */
-
-/**
- * POST /profiles/me  (protegido)
- * Crea/actualiza perfil del usuario autenticado.
- * Campos:
- *  - displayName* (string)
- *  - level* (number 1..7)
- *  - availability (array<string>) ej: ["Lun tarde","Sab mañana"]
- *  - experience (string, opcional, 0..140)
- *  - style (string, opcional, 0..140)
- *  - age (number, opcional)
- *  - gender ("masculino"|"femenino"|null)
- *  - city (string, opcional)
- *  - zone (string, opcional)
- */
-app.post('/profiles/me', authMiddleware, async (req, res) => {
-  try {
-    const uid = req.user.uid;
-    const {
-      displayName,
-      level,
-      availability,
-      experience,
-      style,
-      age,
-      gender,
-      city,
-      zone,
-    } = req.body || {};
-
-    if (!displayName || !String(displayName).trim()) {
-      return res.status(400).json({ error: 'displayName es obligatorio' });
-    }
-    const lvlNum = Number(level);
-    if (!Number.isFinite(lvlNum) || lvlNum < 1 || lvlNum > 7) {
-      return res.status(400).json({ error: 'level debe estar entre 1 y 7' });
-    }
-
-    const doc = {
-      uid,
-      displayName: String(displayName).trim(),
-      level: lvlNum,
-      availability: Array.isArray(availability) ? availability.slice(0, 10) : null,
-      experience: experience ? String(experience).slice(0, 140) : null,
-      style: style ? String(style).slice(0, 140) : null,
-      age: Number.isFinite(Number(age)) ? Number(age) : null,
-      gender: (gender === 'masculino' || gender === 'femenino') ? gender : null,
-      city: city || null,
-      zone: zone || null,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    };
-
-    await db.collection('profiles').doc(uid).set(doc, { merge: true });
-    res.json({ ok: true });
+    const u = await admin.auth().createUser({ email, password });
+    res.json({ uid: u.uid, email: u.email });
   } catch (e) {
     res.status(400).json({ error: e.message });
   }
 });
 
-/**
- * GET /profiles/me  (protegido)
- * Devuelve el perfil del usuario autenticado (o null).
- */
-app.get('/profiles/me', authMiddleware, async (req, res) => {
-  try {
-    const snap = await db.collection('profiles').doc(req.user.uid).get();
-    res.json(snap.exists ? snap.data() : null);
-  } catch (e) {
-    res.status(400).json({ error: e.message });
-  }
+/** Obtener/guardar perfil: /profiles/{uid}  */
+app.get('/me', authMiddleware, async (req, res) => {
+  const ref = db.collection('profiles').doc(req.user.uid);
+  const snap = await ref.get();
+  res.json(snap.exists ? snap.data() : null);
 });
 
-/* =======================================
- * MATCHES
- * ======================================= */
+app.put('/profile', authMiddleware, async (req, res) => {
+  const p = req.body || {};
 
+  // Campos alineados con el front (bandas, posición, estilo de juego)
+  const safe = {
+    uid: req.user.uid,
+    displayName: (p.displayName || '').trim(),
+
+    // banda y ranking para facilitar filtros futuros
+    levelBand: p.levelBand || '8va',
+    levelBandRank: rankOf(p.levelBand || '8va'),
+
+    position: p.position || 'Drive',
+    styleGame: p.styleGame || 'Ofensivo',
+
+    experienceYears: Number(p.experienceYears) || 0,
+    age: p.age ? Number(p.age) : null,
+    gender: p.gender || 'Masculino',
+    city: p.city || '',
+    zone: p.zone || '',
+
+    updatedAt: nowTs(),
+    createdAt: nowTs(),
+  };
+
+  await db.collection('profiles').doc(req.user.uid).set(safe, { merge: true });
+  res.json(safe);
+});
+
+/* ======================= MATCHES ======================= */
 /**
- * POST /matches  (protegido)
- * Crea partido con modalidad y cupo:
- *  - mode: "1v1" (maxPlayers=2) | "2v2" (maxPlayers=4)  *obligatorio
- *  - levelMin / levelMax (si no se envían, se auto-derivan del nivel del creador ±0.5)
- *  - players arranca con el creador
- *  - status: "open" → pasa a "full" cuando se completa el cupo
+ * Crear partido (2v2 fijo: 4 jugadores)
+ * El creador queda agregado en players.
+ * Guardamos bandas y también “rank” para filtros.
  */
 app.post('/matches', authMiddleware, async (req, res) => {
   try {
-    const uid = req.user.uid;
+    const p = req.body || {};
+    const players = [req.user.uid];
 
-    // Nivel del creador (obligatorio para auto-limitar)
-    const meSnap = await db.collection('profiles').doc(uid).get();
-    const myProfile = meSnap.exists ? meSnap.data() : null;
-    if (!myProfile || !myProfile.level) {
-      return res.status(400).json({ error: 'Completá tu perfil (nivel) antes de crear partidos' });
-    }
+    const levelMinBand = p.levelMin || '8va';
+    const levelMaxBand = p.levelMax || '3ra';
 
-    const {
-      title,
-      date,          // "YYYY-MM-DD" (MVP simple)
-      time,          // "HH:mm"
-      location,      // club/cancha
-      mode,          // "1v1" | "2v2"
-      levelMin,
-      levelMax,
-      zone,
-    } = req.body || {};
+    const docData = {
+      title: (p.title || 'Partido').trim(),
+      date: p.date || null,      // YYYY-MM-DD
+      time: p.time || null,      // HH:mm
+      location: p.location || null,
+      mode: '2v2',
+      zone: p.zone || null,
 
-    if (!mode || !['1v1', '2v2'].includes(mode)) {
-      return res.status(400).json({ error: 'mode debe ser "1v1" o "2v2"' });
-    }
-    const maxPlayers = mode === '1v1' ? 2 : 4;
+      levelMin: levelMinBand,
+      levelMax: levelMaxBand,
+      levelMinRank: rankOf(levelMinBand),
+      levelMaxRank: rankOf(levelMaxBand),
 
-    const lvlMin = Number.isFinite(Number(levelMin)) ? Number(levelMin) : Math.max(1, myProfile.level - 0.5);
-    const lvlMax = Number.isFinite(Number(levelMax)) ? Number(levelMax) : Math.min(7, myProfile.level + 0.5);
-    if (lvlMin > lvlMax) return res.status(400).json({ error: 'levelMin no puede ser > levelMax' });
-
-    const payload = {
-      title: (title || location || 'Partido'),
-      date: date || null,
-      time: time || null,
-      location: location || null,
-      zone: zone || myProfile.zone || null,
-      mode,
-      maxPlayers,
-      levelMin: lvlMin,
-      levelMax: lvlMax,
-      players: [uid], // el creador se anota
-      createdBy: uid,
-      status: 'open', // open | full | closed
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      createdBy: req.user.uid,
+      createdAt: nowTs(),
+      updatedAt: nowTs(),
+      maxPlayers: 4,             // 2v2 fijo
+      players,
+      status: players.length >= 4 ? 'full' : 'open', // open|full
     };
 
-    const ref = await db.collection('matches').add(payload);
-    const doc = await ref.get();
-    res.status(201).json({ id: ref.id, ...doc.data() });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-/**
- * GET /matches  (abierta)
- * Lista partidos abiertos con filtros opcionales:
- *  - ?level=N       (devuelve los que incluyan N entre [levelMin, levelMax])
- *  - ?date=YYYY-MM-DD
- *  - ?zone=Palermo
- */
-app.get('/matches', async (req, res) => {
-  try {
-    let q = db.collection('matches').where('status', '==', 'open');
-    const level = req.query.level ? Number(req.query.level) : null;
-    const date = req.query.date || null;
-    const zone = req.query.zone || null;
-
-    if (date) q = q.where('date', '==', date);
-    if (zone) q = q.where('zone', '==', zone);
-    if (level !== null && !Number.isNaN(level)) q = q.where('levelMin', '<=', level);
-
-    const snap = await q.orderBy('createdAt', 'desc').limit(50).get();
-    let items = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-
-    if (level !== null && !Number.isNaN(level)) {
-      items = items.filter(m => (typeof m.levelMax === 'number' ? m.levelMax >= level : true));
-    }
-
-    res.json(items);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-/**
- * POST /matches/:id/join  (protegido)
- * Se une al partido si:
- *  - está "open"
- *  - hay cupo (players < maxPlayers)
- *  - el nivel del jugador está dentro de [levelMin, levelMax]
- *  - no está ya unido
- * Si se completa el cupo, marca `status: full`.
- */
-app.post('/matches/:id/join', authMiddleware, async (req, res) => {
-  try {
-    const uid = req.user.uid;
-
-    // Perfil del que se une
-    const profSnap = await db.collection('profiles').doc(uid).get();
-    const myProfile = profSnap.exists ? profSnap.data() : null;
-    if (!myProfile || !myProfile.level) {
-      return res.status(400).json({ message: 'Completá tu perfil (nivel) antes de unirte' });
-    }
-
-    const matchRef = db.collection('matches').doc(req.params.id);
-    const matchDoc = await matchRef.get();
-    if (!matchDoc.exists) return res.status(404).json({ message: 'Partido no encontrado' });
-
-    const match = matchDoc.data() || {};
-    const players = Array.isArray(match.players) ? match.players : [];
-    const maxPlayers = typeof match.maxPlayers === 'number' ? match.maxPlayers : 4;
-
-    if (match.status !== 'open') return res.status(400).json({ message: 'Partido cerrado' });
-    if (players.includes(uid)) return res.status(400).json({ message: 'Ya estás en el partido' });
-    if (players.length >= maxPlayers) return res.status(400).json({ message: 'Partido lleno' });
-
-    // Chequeo de nivel compatible
-    const lvlOk =
-      (typeof match.levelMin !== 'number' || myProfile.level >= match.levelMin) &&
-      (typeof match.levelMax !== 'number' || myProfile.level <= match.levelMax);
-    if (!lvlOk) return res.status(400).json({ message: 'Tu nivel no coincide con el requerido' });
-
-    // Anotar jugador
-    await matchRef.update({ players: admin.firestore.FieldValue.arrayUnion(uid) });
-
-    // Si se llenó, cerrar
-    const updated = await matchRef.get();
-    const after = updated.data();
-    if ((after.players?.length || 0) >= after.maxPlayers) {
-      await matchRef.update({ status: 'full' });
-    }
-
-    res.json({ message: 'Te uniste al partido' });
+    const ref = await db.collection('matches').add(docData);
+    const snap = await ref.get();
+    res.status(201).json({ id: ref.id, ...snap.data() });
   } catch (e) {
     res.status(500).json({ message: e.message });
   }
 });
 
-/* -------- Exportar Express como Function HTTPS (Gen2) -------- */
+/**
+ * Listado general con filtros (?levelBand=&date=).
+ * Para NO requerir índices compuestos, si hay filtros NO usamos orderBy en Firestore;
+ * traemos hasta 50 y ordenamos en memoria.
+ */
+app.get('/matches', async (req, res) => {
+  try {
+    const levelBand = req.query.levelBand || null;
+    const levelRank = levelBand ? rankOf(levelBand) : null;
+    const date = req.query.date || null;
+
+    let q = db.collection('matches');
+
+    const hasFilter = Boolean(date || levelRank !== null);
+
+    if (date) q = q.where('date', '==', date);
+    if (levelRank !== null) q = q.where('levelMinRank', '<=', levelRank);
+
+    const snap = hasFilter
+      ? await q.limit(50).get() // sin orderBy → sin índice compuesto
+      : await q.orderBy('createdAt', 'desc').limit(50).get();
+
+    let items = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+
+    if (levelRank !== null) {
+      items = items.filter(m => (typeof m.levelMaxRank === 'number' ? m.levelMaxRank >= levelRank : true));
+    }
+
+    // Ordeno en memoria si hubo filtros
+    if (hasFilter) {
+      items.sort((a, b) => (b.createdAt?.toMillis?.() ?? 0) - (a.createdAt?.toMillis?.() ?? 0));
+    }
+
+    res.json(items);
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+/** Mis partidos (creados por mí O a los que me uní) — sin índice compuesto */
+app.get('/matches/mine', authMiddleware, async (req, res) => {
+  try {
+    const uid = req.user.uid;
+
+    // creados por mí
+    const createdSnap = await db.collection('matches')
+      .where('createdBy', '==', uid)
+      .limit(50)
+      .get();
+
+    // donde estoy en players
+    const joinedSnap = await db.collection('matches')
+      .where('players', 'array-contains', uid)
+      .limit(50)
+      .get();
+
+    const map = new Map();
+    createdSnap.docs.forEach(d => map.set(d.id, { id: d.id, ...d.data() }));
+    joinedSnap.docs.forEach(d => map.set(d.id, { id: d.id, ...d.data() }));
+
+    const items = Array.from(map.values())
+      .sort((a, b) => (b.createdAt?.toMillis?.() ?? 0) - (a.createdAt?.toMillis?.() ?? 0));
+
+    res.json(items);
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+/** Partidos abiertos (no llenos, generales) — se mantiene por compatibilidad */
+app.get('/matches/open', async (_req, res) => {
+  try {
+    const snap = await db.collection('matches')
+      .where('status', '==', 'open')
+      .limit(50)
+      .get();
+
+    const items = snap.docs.map(d => ({ id: d.id, ...d.data() }))
+      .sort((a, b) => (b.createdAt?.toMillis?.() ?? 0) - (a.createdAt?.toMillis?.() ?? 0));
+
+    res.json(items);
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+/** Disponibles para mí: abiertos, no creados por mí y donde no estoy unido */
+app.get('/matches/available', authMiddleware, async (req, res) => {
+  try {
+    const uid = req.user.uid;
+
+    const snap = await db.collection('matches')
+      .where('status', '==', 'open')
+      .limit(50)
+      .get();
+
+    const items = snap.docs
+      .map(d => ({ id: d.id, ...d.data() }))
+      .filter(m => m.createdBy !== uid && !(Array.isArray(m.players) && m.players.includes(uid)))
+      .sort((a, b) => (b.createdAt?.toMillis?.() ?? 0) - (a.createdAt?.toMillis?.() ?? 0));
+
+    res.json(items);
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+/** Unirse */
+app.post('/matches/:id/join', authMiddleware, async (req, res) => {
+  try {
+    const uid = req.user.uid;
+    const ref = db.collection('matches').doc(req.params.id);
+    const snap = await ref.get();
+    if (!snap.exists) return res.status(404).json({ message: 'Partido no encontrado' });
+
+    const m = snap.data();
+    const players = Array.isArray(m.players) ? m.players : [];
+    const maxPlayers = Number(m.maxPlayers) || 4;
+
+    if (m.createdBy === uid) return res.status(400).json({ message: 'Sos el creador' });
+    if (players.includes(uid)) return res.status(400).json({ message: 'Ya estás en el partido' });
+    if (players.length >= maxPlayers) return res.status(400).json({ message: 'Partido lleno' });
+
+    await ref.update({
+      players: admin.firestore.FieldValue.arrayUnion(uid),
+      status: players.length + 1 >= maxPlayers ? 'full' : 'open',
+      updatedAt: nowTs(),
+    });
+    res.json({ message: 'Te uniste' });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+/** Salir */
+app.post('/matches/:id/leave', authMiddleware, async (req, res) => {
+  try {
+    const uid = req.user.uid;
+    const ref = db.collection('matches').doc(req.params.id);
+    const snap = await ref.get();
+    if (!snap.exists) return res.status(404).json({ message: 'Partido no encontrado' });
+
+    const m = snap.data();
+    const players = Array.isArray(m.players) ? m.players : [];
+    if (!players.includes(uid)) return res.status(400).json({ message: 'No estabas en el partido' });
+    if (m.createdBy === uid) return res.status(400).json({ message: 'El creador debe editar o eliminar' });
+
+    await ref.update({
+      players: admin.firestore.FieldValue.arrayRemove(uid),
+      status: 'open',
+      updatedAt: nowTs(),
+    });
+    res.json({ message: 'Saliste del partido' });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+/** Editar (solo creador) */
+app.put('/matches/:id', authMiddleware, async (req, res) => {
+  try {
+    const uid = req.user.uid;
+    const ref = db.collection('matches').doc(req.params.id);
+    const snap = await ref.get();
+    if (!snap.exists) return res.status(404).json({ message: 'Partido no encontrado' });
+    if (snap.data().createdBy !== uid) return res.status(403).json({ message: 'No autorizado' });
+
+    const p = req.body || {};
+
+    const patch = {
+      title: p.title ?? snap.data().title,
+      date: p.date ?? snap.data().date,
+      time: p.time ?? snap.data().time,
+      location: p.location ?? snap.data().location,
+      zone: p.zone ?? snap.data().zone,
+
+      levelMin: p.levelMin ?? snap.data().levelMin,
+      levelMax: p.levelMax ?? snap.data().levelMax,
+      levelMinRank: p.levelMin ? rankOf(p.levelMin) : snap.data().levelMinRank,
+      levelMaxRank: p.levelMax ? rankOf(p.levelMax) : snap.data().levelMaxRank,
+
+      updatedAt: nowTs(),
+    };
+
+    await ref.update(patch);
+    const updated = await ref.get();
+    res.json({ id: ref.id, ...updated.data() });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+/** Eliminar (solo creador) */
+app.delete('/matches/:id', authMiddleware, async (req, res) => {
+  try {
+    const uid = req.user.uid;
+    const ref = db.collection('matches').doc(req.params.id);
+    const snap = await ref.get();
+    if (!snap.exists) return res.status(404).json({ message: 'Partido no encontrado' });
+    if (snap.data().createdBy !== uid) return res.status(403).json({ message: 'No autorizado' });
+
+    await ref.delete();
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+/* --------- Export --------- */
 exports.api = onRequest(app);
